@@ -3,6 +3,12 @@ import sys
 import os
 import logging
 from datetime import datetime
+from PyQt6.QtQml import QQmlApplicationEngine
+from PyQt6.QtCore import QObject, pyqtSignal, pyqtSlot, QUrl, QTimer, QThread, QResource
+from PyQt6.QtWidgets import QApplication
+import re
+import yt_dlp
+from PyQt6.QtGui import QGuiApplication, QIcon
 
 # Настраиваем логирование
 script_dir = os.path.dirname(os.path.abspath(__file__))
@@ -31,451 +37,247 @@ sys.excepthook = handle_exception
 try:
     import warnings
     warnings.filterwarnings("ignore", category=DeprecationWarning)
-    
-    from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout, 
-                                QLabel, QLineEdit, QPushButton, QMessageBox,
-                                QProgressBar, QComboBox, QHBoxLayout, QDialog)
-    from PyQt6.QtCore import Qt, QThread, pyqtSignal, QTimer
-    import yt_dlp
-    
     logging.info("Все модули успешно импортированы")
 except Exception as e:
     logging.error(f"Ошибка при импорте модулей: {str(e)}", exc_info=True)
     sys.exit(1)
 
-class DownloaderThread(QThread):
-    progress = pyqtSignal(float, str)
-    finished = pyqtSignal(str)
-    error = pyqtSignal(str)
-    formats_loaded = pyqtSignal(list)
+class DownloadThread(QThread):
+    """Отдельный класс для потока загрузки"""
+    progress_signal = pyqtSignal(dict)  # Сигнал для передачи прогресса
 
-    def __init__(self, url, download_path, selected_format=None):
-        super().__init__()
+    def __init__(self, url, opts, parent=None):
+        super().__init__(parent)
         self.url = url
-        self.download_path = download_path
+        self.opts = opts
         self.is_cancelled = False
-        self.ydl = None
-        self.selected_format = selected_format
-        self.is_format_check = selected_format is None
-
-    def hook(self, d):
-        if self.is_cancelled:
-            raise Exception("Загрузка отменена пользователем")
-            
-        if d['status'] == 'downloading':
-            downloaded = d.get('downloaded_bytes', 0)
-            total = d.get('total_bytes', 0)
-            if total:
-                percentage = (downloaded / total) * 100
-                speed = d.get('speed', 0)
-                if speed:
-                    speed_mb = speed / 1024 / 1024
-                    status = f'Скорость: {speed_mb:.1f} МБ/с'
-                else:
-                    status = 'Загрузка...'
-                self.progress.emit(percentage, status)
-
-    def cancel_download(self):
-        self.is_cancelled = True
-        if self.ydl:
-            self.ydl.cancel_download()
-
-    def get_formats(self):
-        try:
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-            }
-            
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                info = ydl.extract_info(self.url, download=False)
-                formats = []
-                seen_qualities = set()
-                
-                # Сначала получаем все доступные форматы
-                for f in info.get('formats', []):
-                    # Проверяем только видео форматы
-                    if f.get('vcodec', 'none') != 'none':
-                        height = f.get('height', 0)
-                        if height and height not in seen_qualities:
-                            # Добавляем стандартные разрешения
-                            if height in [144, 240, 360, 480, 720, 1080, 1440, 2160, 4320]:
-                                seen_qualities.add(height)
-                                formats.append(f'{height}p')
-                
-                # Сортируем форматы по качеству (от высокого к низкому)
-                formats.sort(key=lambda x: int(x[:-1]), reverse=True)
-                
-                if not formats:
-                    # Если форматы не найдены, добавляем хотя бы один стандартный
-                    formats = ['720p']
-                
-                return formats
-                
-        except Exception as e:
-            self.error.emit(str(e))
-            return ['720p']  # Возвращаем стандартное качество в случае ошибки
 
     def run(self):
         try:
-            if self.is_format_check:
-                formats = self.get_formats()
-                self.formats_loaded.emit(formats)
-                return
+            def progress_hook(d):
+                if self.is_cancelled:
+                    raise Exception("Download cancelled")
+                self.progress_signal.emit(d)
 
-            format_height = self.selected_format[:-1]  # Убираем 'p' из строки
-            ydl_opts = {
-                'format': f'bestvideo[height<={format_height}][ext=mp4]+bestaudio[ext=m4a]/best[height<={format_height}]',
-                'outtmpl': os.path.join(self.download_path, '%(title)s.%(ext)s'),
-                'progress_hooks': [self.hook],
-                'quiet': True,
-                'no_warnings': True,
-                'merge_output_format': 'mp4',
-                'postprocessors': [{
-                    'key': 'FFmpegVideoConvertor',
-                    'preferedformat': 'mp4',
-                }],
-                'prefer_ffmpeg': True,
-                'writesubtitles': False,
-            }
+            # Добавляем обработчик для существующих файлов
+            def already_downloaded_hook(info_dict):
+                # Всегда разрешаем перезапись
+                return True
+
+            self.opts['progress_hooks'] = [progress_hook]
+            self.opts['overwrites'] = True  # Разрешаем перезапись
+            self.opts['nooverwrites'] = False  # Отключаем защиту от перезаписи
+            self.opts['force_overwrites'] = True  # Принудительная перезапись
+            self.opts['already_downloaded_hook'] = already_downloaded_hook
             
-            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                self.ydl = ydl
-                info = ydl.extract_info(self.url, download=False)
-                title = info.get('title', 'video')
-                
-                if not self.is_cancelled:
-                    self.progress.emit(0, f"Начинаем загрузку в {self.selected_format}")
-                    ydl.download([self.url])
-                    self.finished.emit(title)
-                
+            with yt_dlp.YoutubeDL(self.opts) as ydl:
+                ydl.download([self.url])
         except Exception as e:
-            if self.is_cancelled:
-                self.error.emit("Загрузка отменена пользователем")
-            else:
-                self.error.emit(str(e))
-        finally:
-            self.ydl = None
+            logging.error(f"Ошибка в потоке загрузки: {str(e)}", exc_info=True)
 
-class LoadingDialog(QDialog):
-    def __init__(self, parent=None):
-        super().__init__(parent)
-        self.setWindowTitle("Загрузка")
-        self.setFixedSize(400, 120)  # Увеличили размер окна
-        self.setWindowFlag(Qt.WindowType.WindowCloseButtonHint, False)
-        self.setModal(True)
-        
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(20, 20, 20, 20)  # Добавили отступы
-        
-        # Добавляем сообщение с переносом текста
-        self.message = QLabel("Получение вариантов разрешения\nвидеоролика...")
-        self.message.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.message.setStyleSheet("""
-            QLabel {
-                font-size: 11pt;
-                qproperty-wordWrap: true;
-                padding: 10px;
-            }
-        """)
-        layout.addWidget(self.message)
-        
-        # Добавляем прогресс-бар
-        self.progress = QProgressBar()
-        self.progress.setStyleSheet("""
-            QProgressBar {
-                border: 2px solid #ccc;
-                border-radius: 5px;
-                text-align: center;
-                height: 20px;
-                margin-top: 10px;
-            }
-            QProgressBar::chunk {
-                background-color: #4CAF50;
-            }
-        """)
-        self.progress.setMinimum(0)
-        self.progress.setMaximum(0)  # Бесконечная анимация
-        layout.addWidget(self.progress)
+    def cancel(self):
+        self.is_cancelled = True
 
-class YouTubeDownloader(QMainWindow):
+class Backend(QObject):
+    progressChanged = pyqtSignal(float, float, str)  # percent, mbValue, speed
+    downloadFinished = pyqtSignal(str)
+    downloadError = pyqtSignal(str)
+    formatsLoaded = pyqtSignal(list)
+    loadingStarted = pyqtSignal()
+    loadingFinished = pyqtSignal()
+    downloadStarted = pyqtSignal()
+    urlValidationError = pyqtSignal(str)  # Новый сигнал для ошибок валидации
+
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("YouTube Загрузчик")
-        self.setFixedSize(600, 300)  # Увеличили высоту для комбобокса
+        self.download_thread = None
         
-        central_widget = QWidget()
-        self.setCentralWidget(central_widget)
-        layout = QVBoxLayout(central_widget)
-        layout.setContentsMargins(20, 20, 20, 20)
-        
-        self.url_label = QLabel("Вставьте ссылку на YouTube видео:")
-        self.url_label.setStyleSheet("font-size: 12pt;")
-        layout.addWidget(self.url_label)
-        
-        self.url_entry = QLineEdit()
-        self.url_entry.setStyleSheet("""
-            QLineEdit {
-                font-size: 11pt;
-                padding: 5px;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-            }
-        """)
-        self.url_entry.textChanged.connect(self.on_url_changed)
-        layout.addWidget(self.url_entry)
-        
-        # Добавляем выбор качества
-        quality_layout = QHBoxLayout()
-        
-        self.quality_label = QLabel("Качество видео:")
-        self.quality_label.setStyleSheet("font-size: 11pt;")
-        quality_layout.addWidget(self.quality_label)
-        
-        self.quality_combo = QComboBox()
-        self.quality_combo.setStyleSheet("""
-            QComboBox {
-                font-size: 11pt;
-                padding: 5px;
-                border: 1px solid #ccc;
-                border-radius: 4px;
-                min-width: 100px;
-            }
-        """)
-        self.quality_combo.setEnabled(False)
-        quality_layout.addWidget(self.quality_combo)
-        
-        layout.addLayout(quality_layout)
-        
-        self.download_button = QPushButton("Скачать видео")
-        self.download_button.setStyleSheet("""
-            QPushButton {
-                background-color: #4CAF50;
-                color: white;
-                font-size: 11pt;
-                font-weight: bold;
-                padding: 10px 20px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #45a049;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.download_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.download_button.clicked.connect(self.start_download)
-        self.download_button.setEnabled(False)
-        layout.addWidget(self.download_button)
-        
-        self.cancel_button = QPushButton("Отменить загрузку")
-        self.cancel_button.setStyleSheet("""
-            QPushButton {
-                background-color: #f44336;
-                color: white;
-                font-size: 11pt;
-                font-weight: bold;
-                padding: 10px 20px;
-                border: none;
-                border-radius: 4px;
-            }
-            QPushButton:hover {
-                background-color: #d32f2f;
-            }
-            QPushButton:disabled {
-                background-color: #cccccc;
-            }
-        """)
-        self.cancel_button.setCursor(Qt.CursorShape.PointingHandCursor)
-        self.cancel_button.clicked.connect(self.cancel_download)
-        self.cancel_button.hide()
-        layout.addWidget(self.cancel_button)
-        
-        self.progress_bar = QProgressBar()
-        self.progress_bar.setStyleSheet("""
-            QProgressBar {
-                border: 2px solid #ccc;
-                border-radius: 5px;
-                text-align: center;
-                height: 25px;
-            }
-            QProgressBar::chunk {
-                background-color: #4CAF50;
-            }
-        """)
-        self.progress_bar.hide()
-        layout.addWidget(self.progress_bar)
-        
-        self.status_label = QLabel("")
-        self.status_label.setStyleSheet("""
-            QLabel {
-                font-size: 10pt;
-                color: #666;
-            }
-        """)
-        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        self.status_label.hide()
-        layout.addWidget(self.status_label)
-        
-        layout.addStretch()
-        
-        # Добавляем таймер для задержки проверки форматов
-        self.url_check_timer = QTimer()
-        self.url_check_timer.setSingleShot(True)
-        self.url_check_timer.timeout.connect(self.delayed_format_check)
-        
-        # Добавляем диалог загрузки как атрибут класса
-        self.loading_dialog = None
+        # Создаем папку Downloads в директории приложения
+        self.download_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'Downloads')
+        if not os.path.exists(self.download_path):
+            os.makedirs(self.download_path)
+            logging.info(f"Создана папка для загрузок: {self.download_path}")
 
-    def on_url_changed(self, url):
-        if url.strip():
-            # Сбрасываем и запускаем таймер при каждом изменении URL
-            self.url_check_timer.stop()
-            self.url_check_timer.start(1000)  # 1 секунда задержки
-        else:
-            self.quality_combo.clear()
-            self.quality_combo.setEnabled(False)
-            self.download_button.setEnabled(False)
+        # Регулярное выражение для проверки YouTube URL
+        self.youtube_regex = r'^(https?://)?(www\.)?(youtube\.com/watch\?v=|youtu\.be/)[a-zA-Z0-9_-]{11}.*$'
 
-    def delayed_format_check(self):
-        url = self.url_entry.text().strip()
-        if url:
-            self.check_formats(url)
+    def validate_youtube_url(self, url):
+        if not re.match(self.youtube_regex, url):
+            return False
+        return True
 
-    def check_formats(self, url):
-        # Создаем и показываем диалог загрузки
-        self.loading_dialog = LoadingDialog(self)
-        self.loading_dialog.show()
-        
-        self.quality_combo.clear()
-        self.quality_combo.setEnabled(False)
-        self.download_button.setEnabled(False)
-        
-        self.format_checker = DownloaderThread(url, "", None)
-        self.format_checker.formats_loaded.connect(self.on_formats_loaded)
-        self.format_checker.error.connect(self.on_format_check_error)
-        self.format_checker.start()
+    @pyqtSlot(str)
+    def startDownload(self, url):
+        try:
+            if self.download_thread and self.download_thread.isRunning():
+                logging.info("Отмена текущей загрузки")
+                self.download_thread.cancel()
+                self.download_thread.wait()
+                return
 
-    def on_formats_loaded(self, formats):
-        # Закрываем диалог загрузки
-        if self.loading_dialog:
-            self.loading_dialog.close()
-            self.loading_dialog = None
-        
-        if formats:
-            self.quality_combo.addItems(formats)
-            self.quality_combo.setEnabled(True)
-            self.download_button.setEnabled(True)
-
-    def on_format_check_error(self, error):
-        # Закрываем диалог загрузки при ошибке
-        if self.loading_dialog:
-            self.loading_dialog.close()
-            self.loading_dialog = None
-        
-        self.download_error(error)
-
-    def start_download(self):
-        url = self.url_entry.text().strip()
-        selected_quality = self.quality_combo.currentText()
-        
-        if not url or not selected_quality:
-            QMessageBox.critical(
-                self,
-                "Ошибка",
-                "Пожалуйста, введите ссылку на видео и выберите качество"
-            )
-            return
-        
-        downloads_path = os.path.join(os.getcwd(), "Downloads")
-        if not os.path.exists(downloads_path):
-            os.makedirs(downloads_path)
-        
-        self.download_button.hide()
-        self.cancel_button.show()
-        self.progress_bar.setValue(0)
-        self.progress_bar.show()
-        self.status_label.show()
-        self.status_label.setText("Подготовка к загрузке...")
-        
-        self.downloader = DownloaderThread(url, downloads_path, selected_quality)
-        self.downloader.progress.connect(self.update_progress)
-        self.downloader.finished.connect(self.download_finished)
-        self.downloader.error.connect(self.download_error)
-        self.downloader.start()
-
-    def update_progress(self, percentage, status):
-        self.progress_bar.setValue(int(percentage))
-        self.status_label.setText(status)
-
-    def cancel_download(self):
-        if hasattr(self, 'downloader'):
-            self.downloader.cancel_download()
-            self.status_label.setText("Отмена загрузки...")
-            self.cancel_button.setEnabled(False)
-            # Восстанавливаем интерфейс после отмены
-            QTimer.singleShot(1000, self.reset_interface)
-
-    def reset_interface(self):
-        """Восстановление интерфейса в исходное состояние"""
-        self.cancel_button.hide()
-        self.cancel_button.setEnabled(True)
-        self.download_button.show()
-        self.progress_bar.hide()
-        self.status_label.hide()
-        self.quality_combo.setEnabled(True)
-        
-        # Если URL все еще присутствует, активируем кнопку загрузки
-        if self.url_entry.text().strip():
-            self.download_button.setEnabled(True)
-
-    def download_error(self, error_message):
-        self.reset_interface()  # Используем общий метод для сброса интерфейса
-        
-        if "Загрузка отменена пользователем" in error_message:
-            QMessageBox.information(
-                self,
-                "Отмена",
-                "Загрузка была отменена"
-            )
-            return
+            logging.info(f"Начало загрузки видео: {url}")
+            self.downloadStarted.emit()
             
-        if "Private video" in error_message:
-            error_message = "Видео является приватным"
-        elif "not available" in error_message:
-            error_message = "Видео недоступно"
-        elif "age-restricted" in error_message:
-            error_message = "Видео имеет возрастные ограничения"
-        
-        QMessageBox.critical(
-            self,
-            "Ошибка",
-            f"Произошла ошибка при скачивании: {error_message}"
-        )
+            ydl_opts = {
+                'format': 'bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+                'nocheckcertificate': True,
+                'ignoreerrors': False,
+                'no_warnings': False,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                },
+                'socket_timeout': 10,
+                'legacy_server_connect': True,
+                'quiet': False,
+                'no_color': True,
+                'noprogress': False,
+                'outtmpl': os.path.join(self.download_path, '%(title)s.%(ext)s'),
+                'overwrites': True,  # Разрешаем перезапись
+                'nooverwrites': False,  # Отключаем защиту от перезаписи
+                'force_overwrites': True,  # Принудительная перезапись
+            }
+            
+            self.download_thread = DownloadThread(url, ydl_opts, self)
+            self.download_thread.progress_signal.connect(self._progress_hook)
+            self.download_thread.start()
 
-    def download_finished(self, title):
-        self.progress_bar.setValue(100)
-        self.status_label.setText("Загрузка завершена!")
-        self.reset_interface()  # Используем общий метод для сброса интерфейса
-        self.url_entry.clear()  # Очищаем поле ввода URL
-        
-        QMessageBox.information(
-            self,
-            "Успех",
-            f"Видео '{title}' успешно скачано в папку Downloads!"
-        )
+        except Exception as e:
+            self.downloadError.emit(str(e))
+            logging.error(f"Ошибка при скачивании: {str(e)}", exc_info=True)
 
-if __name__ == "__main__":
-    try:
-        logging.info("Запуск приложения")
-        app = QApplication(sys.argv)
-        app.setStyle('Fusion')
-        window = YouTubeDownloader()
-        window.show()
-        logging.info("Окно приложения создано и отображено")
-        sys.exit(app.exec())
-    except Exception as e:
-        logging.error(f"Ошибка при запуске приложения: {str(e)}", exc_info=True)
-        sys.exit(1) 
+    @pyqtSlot(str)
+    def checkFormats(self, url):
+        if not self.validate_youtube_url(url):
+            self.urlValidationError.emit("Некорректная ссылка на YouTube видео")
+            return
+
+        try:
+            self.loadingStarted.emit()
+            logging.info(f"Получение форматов для URL: {url}")
+            
+            ydl_opts = {
+                'quiet': True,
+                'nocheckcertificate': True,
+                'ignoreerrors': False,
+                'no_warnings': False,
+                'http_headers': {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                },
+                'socket_timeout': 10,
+                'legacy_server_connect': True
+            }
+
+            # Создаем отдельный поток для получения форматов
+            class FormatCheckThread(QThread):
+                formatsReady = pyqtSignal(list)
+                error = pyqtSignal(str)
+
+                def __init__(self, url, opts):
+                    super().__init__()
+                    self.url = url
+                    self.opts = opts
+
+                def run(self):
+                    try:
+                        with yt_dlp.YoutubeDL(self.opts) as ydl:
+                            info = ydl.extract_info(self.url, download=False)
+                            formats = []
+                            for f in info['formats']:
+                                if 'height' in f and f['height'] is not None and 'ext' in f:
+                                    format_str = f"{f['height']}p ({f['ext']})"
+                                    formats.append(format_str)
+                            
+                            formats = sorted(list(set(formats)), 
+                                          key=lambda x: int(x.split('p')[0]), 
+                                          reverse=True)
+                            self.formatsReady.emit(formats)
+                    except Exception as e:
+                        self.error.emit(str(e))
+
+            # Создаем и настраиваем поток
+            self.format_thread = FormatCheckThread(url, ydl_opts)
+            self.format_thread.formatsReady.connect(self._on_formats_ready)
+            self.format_thread.error.connect(self._on_format_check_error)
+            self.format_thread.start()
+
+        except Exception as e:
+            self.downloadError.emit(str(e))
+            self.loadingFinished.emit()
+            logging.error(f"Ошибка при получении форматов: {str(e)}", exc_info=True)
+
+    def _on_formats_ready(self, formats):
+        logging.info(f"Найдены форматы: {formats}")
+        self.formatsLoaded.emit(formats)
+        self.loadingFinished.emit()
+
+    def _on_format_check_error(self, error):
+        self.downloadError.emit(error)
+        self.loadingFinished.emit()
+
+    def _progress_hook(self, d):
+        try:
+            if d['status'] == 'downloading':
+                downloaded = d.get('downloaded_bytes', 0)
+                total = d.get('total_bytes', 0)
+                
+                if total == 0:
+                    total = d.get('total_bytes_estimate', 0)
+
+                # Форматируем размер в МБ
+                downloaded_mb = round(downloaded / 1024 / 1024, 1)
+                total_mb = round(total / 1024 / 1024, 1) if total > 0 else 0
+
+                # Вычисляем процент для прогресс-бара
+                progress_percent = (downloaded / total * 100) if total > 0 else 0
+                
+                # Форматируем скорость
+                speed = d.get('speed', 0)
+                if speed:
+                    speed_str = f"Скорость: {speed/1024/1024:.1f} МБ/с"
+                else:
+                    speed_str = "Вычисление скорости..."
+
+                # Отправляем процент и значение в МБ как float, и скорость как str
+                self.progressChanged.emit(float(progress_percent), float(downloaded_mb), speed_str)
+            
+            elif d['status'] == 'finished':
+                filename = d.get('filename', 'Загрузка завершена')
+                filename = os.path.basename(filename)
+                logging.info(f"Загрузка завершена: {filename}")
+                self.downloadFinished.emit(filename)
+
+        except Exception as e:
+            logging.error(f"Ошибка в progress_hook: {str(e)}", exc_info=True)
+            self.downloadError.emit(str(e))
+
+def main():
+    app = QGuiApplication(sys.argv)
+    
+    # Устанавливаем иконку приложения
+    icon_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'icons', 'app.svg')
+    app.setWindowIcon(QIcon(icon_path))
+    
+    # Создаем экземпляр backend и регистрируем его в контексте QML
+    backend = Backend()
+    
+    engine = QQmlApplicationEngine()
+    engine.rootContext().setContextProperty("backend", backend)
+    
+    # Получаем абсолютный путь к директории проекта
+    current_dir = os.path.dirname(os.path.abspath(__file__))
+    
+    # Добавляем путь к папке с QML файлами в движок
+    engine.addImportPath(current_dir)
+    
+    # Загружаем основной QML файл
+    qml_file = os.path.join(current_dir, 'main.qml')
+    engine.load(QUrl.fromLocalFile(qml_file))
+    
+    if not engine.rootObjects():
+        logging.error("Ошибка загрузки QML файла")
+        sys.exit(-1)
+        
+    sys.exit(app.exec())
+
+if __name__ == '__main__':
+    main() 

@@ -5,9 +5,10 @@ import logging
 from datetime import datetime
 
 # Настраиваем логирование
-log_dir = os.path.expanduser('~/.local/share/youtube_downloader/logs')
+script_dir = os.path.dirname(os.path.abspath(__file__))
+log_dir = os.path.join(script_dir, 'logs')
 os.makedirs(log_dir, exist_ok=True)
-log_file = os.path.join(log_dir, f'youtube_downloader.log')
+log_file = os.path.join(log_dir, 'youtube_downloader.log')
 
 logging.basicConfig(
     level=logging.DEBUG,
